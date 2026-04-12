@@ -1,0 +1,7 @@
+2026-02-07T06:39:24.459678Z Received from S38: hi
+2026-02-07T06:42:47.085526Z Received from JAZZ: hekoo thiz ziz ajazz
+Peer: S38
+Msg: hi (QAM-16)
+Msg: hellop (QAM-16)
+Peer: JAZZ
+Msg: hekoo thiz ziz ajazz (QAM-16)
