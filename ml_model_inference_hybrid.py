@@ -193,130 +193,12 @@ def load_in_memory_data(csv_files, random_seed=RANDOM_SEED):
 
 
 # ============================================================================
-# 2. CUSTOM XGBOOST DATA ITERATOR (OUT-OF-CORE GPU TRAINING)
+# 2. XGBOOST TRAINING (GPU-OPTIMIZED WITH XGBCLASSIFIER)
 # ============================================================================
+# XGBoost is trained using XGBClassifier for simplicity and compatibility.
+# It uses tree_method='hist' with GPU acceleration (device='cuda' if available).
+# Training happens on unified in-memory data (10,000 files) with evaluation set.
 
-class XGBoostDataIter(xgb.DataIter):
-    """
-    Custom XGBoost DataIter for out-of-core training from CSV files.
-    Chunks through files, applies scaler, yields to GPU via DeviceQuantileDMatrix.
-    """
-    
-    def __init__(self, csv_files, scaler, feature_cols, batch_size=1024, random_seed=42):
-        """
-        Args:
-            csv_files: List of CSV file paths
-            scaler: Fitted StandardScaler
-            feature_cols: List of feature column names
-            batch_size: Internal chunking size
-            random_seed: Seed for reproducibility
-        """
-        self.csv_files = csv_files
-        self.scaler = scaler
-        self.feature_cols = feature_cols
-        self.batch_size = batch_size
-        self.random_seed = random_seed
-        
-        self.file_index = 0
-        self.current_buffer = None
-        self.buffer_index = 0
-        
-        random.seed(random_seed)
-        random.shuffle(self.csv_files)
-        
-        super().__init__()
-    
-    def _load_next_buffer(self):
-        """Load next batch of files into buffer"""
-        if self.file_index >= len(self.csv_files):
-            return False  # End of data
-        
-        dataframes = []
-        
-        # Load BUFFER_FILES at once
-        for _ in range(BUFFER_FILES):
-            if self.file_index >= len(self.csv_files):
-                break
-            
-            file_path = self.csv_files[self.file_index]
-            self.file_index += 1
-            
-            try:
-                df = pd.read_csv(file_path)
-                
-                # Extract label
-                if 'benign' in file_path.lower():
-                    df['label'] = 0
-                elif 'malicious' in file_path.lower():
-                    df['label'] = 1
-                else:
-                    continue
-                
-                # Add features
-                df['scan_type'] = 1 if 'active_scan' in file_path.lower() else 0
-                if 'rssi' in df.columns:
-                    df['rssi_dbm'] = df['rssi'] - 95
-                
-                dataframes.append(df)
-            
-            except:
-                continue
-        
-        if not dataframes:
-            return False
-        
-        # Combine and preprocess
-        buffer_df = pd.concat(dataframes, ignore_index=True)
-        available_cols = [col for col in self.feature_cols if col in buffer_df.columns]
-        buffer_df = buffer_df[available_cols + ['label']].dropna()
-        
-        if len(buffer_df) == 0:
-            return False
-        
-        # Scale features
-        X = buffer_df[available_cols].values.astype(np.float32)
-        X_scaled = self.scaler.transform(X).astype(np.float32)
-        y = buffer_df['label'].values.astype(np.float32)
-        
-        self.current_buffer = (X_scaled, y)
-        self.buffer_index = 0
-        
-        return True
-    
-    def next(self, input_data):
-        """XGBoost calls this to get next batch"""
-        if self.current_buffer is None and not self._load_next_buffer():
-            return False  # No more data
-        
-        X_scaled, y = self.current_buffer
-        
-        # Get batch
-        end_idx = min(self.buffer_index + self.batch_size, len(X_scaled))
-        X_batch = X_scaled[self.buffer_index:end_idx]
-        y_batch = y[self.buffer_index:end_idx]
-        
-        # Feed to XGBoost
-        input_data(data=X_batch, label=y_batch)
-        self.buffer_index = end_idx
-        
-        # Load next buffer if current exhausted
-        if self.buffer_index >= len(X_scaled):
-            if not self._load_next_buffer():
-                return False
-        
-        return True
-    
-    def reset(self):
-        """Reset iterator"""
-        self.file_index = 0
-        self.current_buffer = None
-        self.buffer_index = 0
-        random.shuffle(self.csv_files)
-
-
-# ============================================================================
-# 3. OPTIMIZED KERAS GENERATOR WITH BUFFERING STRATEGY
-# ============================================================================
 
 class OptimizedKerasGenerator(keras.utils.Sequence):
     """
@@ -486,31 +368,6 @@ class MLPipeline:
         )
         return model
     
-    def build_xgboost(self, n_estimators=100, max_depth=7, learning_rate=0.1):
-        """XGBoost classifier with GPU optimization"""
-        if self.xgb_gpu:
-            model = xgb.XGBClassifier(
-                n_estimators=n_estimators,
-                max_depth=max_depth,
-                learning_rate=learning_rate,
-                random_state=self.random_seed,
-                tree_method='hist',
-                device='cuda',
-                eval_metric='logloss',
-                verbosity=0
-            )
-            return model, True
-        else:
-            model = xgb.XGBClassifier(
-                n_estimators=n_estimators,
-                max_depth=max_depth,
-                learning_rate=learning_rate,
-                random_state=self.random_seed,
-                tree_method='hist',
-                eval_metric='logloss',
-                verbosity=0
-            )
-            return model, False
     
     def build_dnn(self, input_dim):
         """Deep Neural Network"""
@@ -602,38 +459,65 @@ class MLPipeline:
         except Exception as e:
             print(f"  ❌ RF training failed: {e}")
     
-    def train_xgboost_streaming(self, csv_files, feature_cols):
-        """Train XGBoost with custom DataIter for out-of-core streaming"""
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Training XGBoost (out-of-core)...")
+    def build_xgboost(self, n_estimators=100, max_depth=7, learning_rate=0.1):
+        """XGBoost classifier with GPU optimization"""
+        # Use GPU if available
+        if self.xgb_gpu:
+            model = xgb.XGBClassifier(
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                learning_rate=learning_rate,
+                random_state=self.random_seed,
+                tree_method='hist',
+                device='cuda',
+                objective='binary:logistic',
+                base_score=0.5,
+                eval_metric='logloss',
+                verbosity=0
+            )
+            print("  [XGBoost configured for GPU (device='cuda')]")
+        else:
+            # Fallback to CPU with hist method (faster than default)
+            model = xgb.XGBClassifier(
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                learning_rate=learning_rate,
+                random_state=self.random_seed,
+                tree_method='hist',
+                objective='binary:logistic',
+                base_score=0.5,
+                eval_metric='logloss',
+                verbosity=0
+            )
+            print("  [XGBoost configured for CPU (hist - faster than default)]")
+        
+        return model
+    
+    def train_xgboost_streaming(self, X_train, X_test, y_train, y_test):
+        """Train XGBoost on unified in-memory data with GPU optimization"""
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Training XGBoost...")
         try:
-            xgb_model, gpu_enabled = self.build_xgboost()
-            
-            # Create custom iterator
-            data_iter = XGBoostDataIter(
-                csv_files, 
-                scaler_global, 
-                feature_cols,
-                batch_size=1024,
-                random_seed=self.random_seed
-            )
-            
-          # Pass the iterator directly to the sklearn wrapper
+            xgb_model = self.build_xgboost()
             xgb_model.fit(
-                X=data_iter,
-                verbose=False
+                X_train, y_train,
+                eval_set=[(X_test, y_test)],
+                verbose=0
             )
+            xgb_score = xgb_model.score(X_test, y_test)
+            print(f"  ✓ XGBoost Test Accuracy: {xgb_score:.4f}")
+            
             self.models['XGBoost'] = xgb_model
             
             # Save checkpoint
             try:
                 joblib.dump(xgb_model, 'xgboost_model.joblib')
-                gpu_str = " (GPU)" if gpu_enabled else " (CPU)"
-                print(f"  ✓ XGBoost trained{gpu_str} & checkpoint saved")
-            except:
-                print(f"  ✓ XGBoost trained (checkpoint save failed)")
+                print(f"  ✓ XGBoost model saved: xgboost_model.joblib")
+            except Exception as save_err:
+                print(f"  ⚠️  Could not save XGBoost model: {save_err}")
         
         except Exception as e:
             print(f"  ❌ XGBoost training failed: {e}")
+            print(f"  Continuing with next models...\n")
     
     def train_dnn_streaming(self, csv_files, feature_cols):
         """Train DNN with buffered I/O"""
@@ -934,12 +818,11 @@ def main():
     # Train in-memory Random Forest
     pipeline.train_random_forest(X_train, y_train)
     
-    # Train out-of-core XGBoost (on subset for speed)
-    xgboost_files = random.sample(all_files, min(len(all_files), 30000))
-    pipeline.train_xgboost_streaming(xgboost_files, feature_cols)
+    # Train XGBoost on unified in-memory data
+    pipeline.train_xgboost_streaming(X_train, X_test_scaled_global, y_train, y_test_global)
     
     # Train deep learning with buffered I/O
-    dl_files = random.sample(all_files, min(len(all_files), 30000))
+    dl_files = random.sample(all_files, min(len(all_files), 50000))
     pipeline.train_dnn_streaming(dl_files, feature_cols)
     pipeline.train_cnn1d_streaming(dl_files, feature_cols)
     pipeline.train_lstm_streaming(dl_files, feature_cols)
