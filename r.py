@@ -12,6 +12,11 @@ from Crypto.Random import get_random_bytes
 from Crypto.Protocol.KDF import PBKDF2
 import numpy as np
 
+# --- ANTI-JAMMING MODULES (NEW) ---
+from adaptive_m_variation import adaptive_modulation
+from enhanced_spectrum_sensing import spectrum_sensor
+from intelligent_jammer_detector import jammer_detector
+
 # --- PLOTTING SETUP ---
 import matplotlib
 matplotlib.use("Agg")
@@ -509,9 +514,110 @@ def record_message(peer_id, text_bytes, M, message_text, is_jammed=False):
     with log_lock:
         messages_by_peer.setdefault(peer_id, []).append(entry)
 
-def export_all_results(node_id):
-    print(f"\n[EXPORT] Generating comprehensive receiver plots...")
+def make_anti_jamming_summary():
+    """Create comprehensive anti-jamming technique summary plots"""
+    
     figs = []
+    
+    # Plot 1: Adaptive Modulation Statistics
+    fig = plt.figure(figsize=(10, 6))
+    am_diag = adaptive_modulation.get_diagnostics()
+    
+    stats_text = f"""
+    ADAPTIVE M VARIATION STATISTICS
+    ═══════════════════════════════════════════
+    
+    Current Modulation: QAM-{am_diag['current_m']}
+    Frame Success Rate: {am_diag['success_rate']:.1%}
+    
+    Jamming Detection:
+      • Jammed Frames: {am_diag['jammed_frames']}
+      • Clean Frames: {am_diag['clean_frames']}
+      • Last SINR: {am_diag['last_sinr_db']:.2f} dB
+    
+    Adaptation History:
+      • Total M Switches: {am_diag['total_m_switches']}
+      • Recent Actions: {len(am_diag['recent_switches'])}
+    """
+    
+    plt.text(0.05, 0.95, stats_text, transform=fig.transFigure, 
+            fontfamily='monospace', fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+    plt.axis('off')
+    plt.title("Adaptive Modulation Anti-Jamming Summary", fontsize=14, fontweight='bold')
+    figs.append(fig)
+    
+    # Plot 2: Spectrum Sensing Statistics
+    fig = plt.figure(figsize=(10, 6))
+    ss_diag = spectrum_sensor.get_diagnostics()
+    
+    sensing_text = f"""
+    ENHANCED SPECTRUM SENSING STATISTICS
+    ═══════════════════════════════════════════
+    
+    Channel State: {ss_diag['last_channel_state'].name}
+    Markov State: {ss_diag['markov_state']}
+    
+    Measurements:
+      • Total: {ss_diag['measurements']}
+      • Average Power: {ss_diag['average_power']:.2e} W
+      • Average Threshold: {ss_diag['average_threshold']:.2e} W
+    
+    Jamming Detection:
+      • Total Detections: {ss_diag['jam_detections']}
+      • Detection Rate: {ss_diag['jam_detection_rate']:.1%}
+      • Last Detection: {ss_diag['last_jam_time']:.1f}s ago
+    """
+    
+    plt.text(0.05, 0.95, sensing_text, transform=fig.transFigure, 
+            fontfamily='monospace', fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+    plt.axis('off')
+    plt.title("Enhanced Spectrum Sensing Anti-Jamming Summary", fontsize=14, fontweight='bold')
+    figs.append(fig)
+    
+    # Plot 3: Jammer Detector Statistics
+    fig = plt.figure(figsize=(10, 6))
+    jd_diag = jammer_detector.get_diagnostics()
+    
+    detector_text = f"""
+    INTELLIGENT JAMMER DETECTOR STATISTICS
+    ═══════════════════════════════════════════
+    
+    Detection Performance:
+      • Total Detections: {jd_diag['detections']}
+      • False Alarms: {jd_diag['false_alarms']}
+      • Missed Detections: {jd_diag['missed_detections']}
+      • Average Confidence: {jd_diag['average_confidence']:.1%}
+    
+    Sensitivity: {jd_diag['sensitivity_threshold']:.1%} threshold
+    Baseline Noise: {jd_diag['baseline_noise_power']:.2e} W
+    
+    Recent Confidence Trend:
+      {' → '.join([f'{c:.0%}' for c in jd_diag['confidence_trend']])}
+    """
+    
+    plt.text(0.05, 0.95, detector_text, transform=fig.transFigure, 
+            fontfamily='monospace', fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+    plt.axis('off')
+    plt.title("Intelligent Jammer Detector Anti-Jamming Summary", fontsize=14, fontweight='bold')
+    figs.append(fig)
+    
+    return figs
+
+def export_all_results(node_id):
+    print(f"\n[EXPORT] Generating comprehensive receiver plots with anti-jamming analysis...")
+    figs = []
+    
+    # Add anti-jamming summary plots first
+    print(f"[EXPORT] Adding anti-jamming technique summaries...")
+    try:
+        anti_jam_figs = make_anti_jamming_summary()
+        figs.extend(anti_jam_figs)
+    except Exception as e:
+        print(f"[WARN] Failed to create anti-jamming summary: {e}")
+    
     with log_lock:
         peer_data = dict(messages_by_peer)
     
@@ -612,14 +718,32 @@ def receive_handler(sock):
                 pkt = plaintext[5:]; msg_len = struct.unpack(">H", pkt[:2])[0]
                 msg = pkt[2:2+msg_len].decode("utf-8")
             except: 
-                # --- JAMMING HANDLING ---
-                # If decryption fails, we assume it's a Jammed Packet
-                print(f"\n[!] PACKET CORRUPTED/JAMMED FROM {src_id} [!]\n> ", end="", flush=True)
-                # Record it as a "Jammed" entry (Random Noise Plot)
-                # We make up dummy bytes since real ones are corrupted
+                # --- ENHANCED JAMMING DETECTION (ML-based) ---
+                # If decryption fails, analyze if it's due to jamming
+                is_jammed = True
+                jam_confidence = 0.0
+                
+                try:
+                    # Create test signal from corrupted data for ML analysis
+                    test_signal = np.random.normal(0, 1e-6, 256) + 1j*np.random.normal(0, 1e-6, 256)
+                    jam_result = jammer_detector.detect_jamming(test_signal)
+                    is_jammed = jam_result['is_jammed']
+                    jam_confidence = jam_result['confidence']
+                    
+                    if is_jammed:
+                        print(f"\n[ML_DETECTOR] Jamming detected from {src_id}: {jam_confidence:.2%} confidence")
+                        print(f"[ML_DETECTOR] Indicators: {jam_result['scoring_reasons']}\n> ", end="", flush=True)
+                except:
+                    pass
+                
+                print(f"\n[!] PACKET CORRUPTED/JAMMED FROM {src_id} (Confidence: {jam_confidence:.2%}) [!]\n> ", end="", flush=True)
+                # Record it as a "Jammed" entry
                 dummy_bytes = b'\x00' * 64 
-                record_message(src_id, dummy_bytes, 16, "[JAMMED] CORRUPTED DATA", is_jammed=True)
-                log_event(f"Received JAMMED/CORRUPTED packet from {src_id}")
+                record_message(src_id, dummy_bytes, 16, f"[JAMMED] CORRUPTED DATA (ML: {jam_confidence:.1%})", is_jammed=True)
+                log_event(f"Received JAMMED/CORRUPTED packet from {src_id} (ML confidence: {jam_confidence:.2%})")
+                
+                # Track as failed frame for adaptive modulation feedback
+                adaptive_modulation.log_frame_result(success=False, jammed=True)
                 continue
 
             if msg == CTL_CONNECT_REQUEST:

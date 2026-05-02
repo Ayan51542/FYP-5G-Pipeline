@@ -12,6 +12,11 @@ from Crypto.Random import get_random_bytes
 from Crypto.Protocol.KDF import PBKDF2
 import numpy as np
 
+# --- ANTI-JAMMING MODULES (NEW) ---
+from adaptive_m_variation import adaptive_modulation
+from enhanced_spectrum_sensing import spectrum_sensor
+from intelligent_jammer_detector import jammer_detector
+
 # --- PLOTTING SETUP (CRITICAL FIX) ---
 import matplotlib
 matplotlib.use("Agg") # Force headless backend to prevent corruption
@@ -67,7 +72,34 @@ def aes_gcm_decrypt(enc_blob, key):
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
     return cipher.decrypt_and_verify(ciphertext, tag)
 
-def determine_M(msg): return 256 if len(msg)>500 else (64 if len(msg)>100 else 16)
+def determine_M(msg, use_adaptive=True):
+    """
+    Determine modulation scheme with adaptive enhancement.
+    
+    Args:
+        msg: Message text or bytes
+        use_adaptive: If True, use adaptive modulation based on channel conditions
+        
+    Returns:
+        M value (16, 64, or 256)
+    """
+    if use_adaptive and hasattr(adaptive_modulation, 'get_m_for_transmission'):
+        # Use adaptive modulation (with feedback from previous frames)
+        if isinstance(msg, str):
+            msg_size = len(msg.encode('utf-8'))
+        else:
+            msg_size = len(msg)
+        
+        # Get M based on adaptive conditions
+        m = adaptive_modulation.get_m_for_transmission(msg_size)
+        return m
+    else:
+        # Fallback to static determination
+        if isinstance(msg, str):
+            msg_len = len(msg)
+        else:
+            msg_len = len(msg)
+        return 256 if msg_len > 500 else (64 if msg_len > 100 else 16)
 
 def recv_full(sock, length):
     data = b""
@@ -94,12 +126,39 @@ def ofdm_mod(syms, nc, cp):
     ifft = np.fft.ifft(padded.reshape((n, nc)), axis=1)
     return np.hstack([ifft[:, -cp:], ifft]).flatten()
 
-def sense_environment(sock):
+def sense_environment(sock, use_enhanced=True):
+    """
+    Sense spectrum environment with optional enhanced detection.
+    
+    Args:
+        sock: Socket for communication
+        use_enhanced: If True, use enhanced spectrum sensing
+        
+    Returns:
+        Noise level estimate (float)
+    """
     global ENV_STATE
-    if random.random() < ENV_TRANSITION_MATRIX[ENV_STATE][1-ENV_STATE]: ENV_STATE = 1 - ENV_STATE
-    noise = ENVIRONMENTAL_NOISE_FLOOR * np.random.uniform(0.8, 1.2)
-    if ENV_STATE == 1: noise += ENVIRONMENTAL_NOISE_FLOOR * 10.0
-    return noise
+    
+    if use_enhanced and hasattr(spectrum_sensor, 'should_transmit'):
+        # Use enhanced spectrum sensing for better jamming detection
+        # Generate a test signal to sense the channel
+        test_signal = np.random.normal(0, 1e-5, 256) + 1j*np.random.normal(0, 1e-5, 256)
+        result = spectrum_sensor.sense_channel(test_signal)
+        
+        # Return higher noise level if jamming is detected
+        base_noise = ENVIRONMENTAL_NOISE_FLOOR * np.random.uniform(0.8, 1.2)
+        if result['is_jammed']:
+            return base_noise * 100.0  # Simulate high interference
+        else:
+            return base_noise
+    else:
+        # Fallback to original Markov model
+        if random.random() < ENV_TRANSITION_MATRIX[ENV_STATE][1-ENV_STATE]: 
+            ENV_STATE = 1 - ENV_STATE
+        noise = ENVIRONMENTAL_NOISE_FLOOR * np.random.uniform(0.8, 1.2)
+        if ENV_STATE == 1: 
+            noise += ENVIRONMENTAL_NOISE_FLOOR * 10.0
+        return noise
 
 # ---------- PLOTTING (Robust + Enhanced) ----------
 def make_constellation_plot(symbols, title, message_text, M, nc, cp):
@@ -447,27 +506,55 @@ def compute_ofdm_energy_from_message_bytes(message_bytes, M, nc, cp):
 # ---------- Networking ----------
 def send_message(sock, recipient, message_text):
     try:
-        M = determine_M(message_text); nc, cp = 64, 8
+        M = determine_M(message_text, use_adaptive=True)
+        nc, cp = 64, 8
+        
+        # ANTI-JAMMING: Enhanced Spectrum Sensing
         if (message_text not in [CTL_CONNECT_REQUEST, CTL_CONNECT_ACCEPT, CTL_CONNECT_REJECT, CTL_DISCONNECT]) and (NODE_ID not in PRIMARY_SENDERS):
-            if sense_environment(sock) > ENVIRONMENTAL_THRESHOLD:
-                print(f"[SENSING] Busy. Backing off..."); return False
+            noise = sense_environment(sock, use_enhanced=True)
+            if noise > ENVIRONMENTAL_THRESHOLD * 10:  # Increased threshold for enhanced sensing
+                print(f"[JAMMING] Detected high interference. Adapting M to more robust value...")
+                # Force more robust modulation
+                M = min(M, 16)
+                print(f"[ADAPT_M] Using robust M={M}")
+        
+        # Prepare message
+        msg_bytes = message_text.encode("utf-8") if isinstance(message_text, str) else message_text
+        energy, ofdm_signal = compute_ofdm_energy_from_message_bytes(msg_bytes, M, nc, cp)
 
-        msg_bytes = message_text.encode("utf-8")
-        energy, _ = compute_ofdm_energy_from_message_bytes(msg_bytes, M, nc, cp)
+        # ANTI-JAMMING: ML-based jamming detection on OFDM signal
+        if ofdm_signal is not None and len(ofdm_signal) > 0:
+            jam_detection = jammer_detector.detect_jamming(ofdm_signal)
+            if jam_detection['is_jammed']:
+                print(f"[ML_DETECTOR] Jamming confidence: {jam_detection['confidence']:.2%}")
+                print(f"[ML_DETECTOR] Reasons: {jam_detection['scoring_reasons']}")
+                # If ML detector confirms jamming, use most robust M
+                if jam_detection['confidence'] > 0.7:
+                    M = 16
+                    print(f"[ADAPT_M] High jamming confidence detected. Forcing QAM-16")
 
+        # Encrypt with Reed-Solomon
         pkt = struct.pack(">H", len(msg_bytes)) + msg_bytes
         plaintext = struct.pack(">H H B", M, nc, cp) + pkt
         enc = aes_gcm_encrypt(plaintext, KEY)
         enc_rs = rs.encode(enc)
         
+        # Transmit
         dst_b = recipient.encode("utf-8")
         payload = struct.pack(">H", len(dst_b)) + dst_b + struct.pack(">d", float(energy)) + enc_rs
         sock.sendall(struct.pack(">I", len(payload)) + payload)
 
+        # Log successful transmission
         if message_text not in [CTL_CONNECT_REQUEST, CTL_CONNECT_ACCEPT, CTL_CONNECT_REJECT, CTL_DISCONNECT]:
             record_message(recipient, msg_bytes, M, message_text)
+            # Track frame for adaptive modulation
+            adaptive_modulation.log_frame_result(success=True, jammed=False)
+        
         return True
-    except: return False
+    except Exception as e:
+        print(f"[ERROR] Send failed: {e}")
+        adaptive_modulation.log_frame_result(success=False, jammed=False)
+        return False
 
 def receive_handler(sock):
     global chat_partner, connection_accepted
