@@ -802,6 +802,7 @@ def main_loop(sock):
         except Exception as e: print(f"[ERROR] {e}"); stop_event.set()
 
 def main():
+    global NODE_ID
     node_id = ""
     while not re.match(r"^R([1-9]|[1-5][0-9]|60)$", node_id):
         node_id = input("Enter Receiver ID (R1-R60): ").strip().upper()

@@ -1,0 +1,70 @@
+=== HYBRID RECEIVER R2 ===
+
+2026-05-03T18:42:48.965243Z Received from UFONE: Hello, its UFONE
+2026-05-03T18:42:59.191096Z Received from UFONE: YEssss itsssssssv clearr
+2026-05-03T18:43:02.876697Z Received from UFONE: HURRAY
+2026-05-03T18:43:47.249167Z Received from UFONE: Jammer connected??
+2026-05-03T18:44:09.076114Z JAMMED packet from UFONE (NACK sent)
+2026-05-03T18:44:32.696155Z Received from UFONE: HEY>
+2026-05-03T18:44:41.054090Z Received from UFONE: JAMED
+2026-05-03T18:44:50.096180Z JAMMED packet from UFONE (NACK sent)
+2026-05-03T18:44:55.656257Z Received from UFONE: Jammed
+2026-05-03T18:44:56.656214Z Received from UFONE: Jammer connected? right??
+2026-05-03T18:44:56.813882Z Received from UFONE: HEY>
+2026-05-03T18:44:56.861124Z Received from UFONE: JAMED
+2026-05-03T18:44:56.915231Z Received from UFONE: Jammmmeddd i know
+2026-05-03T18:44:56.952356Z Received from UFONE: Jammed
+2026-05-03T18:45:00.037980Z Received from UFONE: Jammed
+2026-05-03T18:45:20.869167Z JAMMED packet from UFONE (NACK sent)
+2026-05-03T18:45:53.380721Z Received from UFONE: BB
+2026-05-03T18:45:58.948499Z JAMMED packet from UFONE (NACK sent)
+2026-05-03T18:46:01.814010Z JAMMED packet from UFONE (NACK sent)
+2026-05-03T18:46:16.190583Z Received from UFONE: Jammer gone?
+2026-05-03T18:46:16.966744Z Received from UFONE: ITs clear or not?
+2026-05-03T18:46:17.053846Z Received from UFONE: Jammed
+2026-05-03T18:46:17.097378Z Received from UFONE: BB
+2026-05-03T18:46:17.153596Z Received from UFONE: JOOOOO
+2026-05-03T18:46:17.219377Z Received from UFONE: JOOOOOOOOOOOOOO
+2026-05-03T18:46:17.288933Z Received from UFONE: Jammer gone?
+2026-05-03T18:46:17.324227Z Received from UFONE: Jammer gone?
+2026-05-03T18:46:17.368642Z Received from UFONE: Jammer gone?
+
+=== RECEIVED MESSAGES ===
+
+From UFONE (36 messages):
+  [CLEAN] HII (QAM-16)
+  [CLEAN] Hello, its UFONE (QAM-16)
+  [CLEAN] YEssss itsssssssv clearr (QAM-16)
+  [CLEAN] HURRAY (QAM-16)
+  [CLEAN] HEEEEEY HAAAAAAAAAAAAA (QAM-16)
+  [CLEAN] YEssss its clearrrrr (QAM-16)
+  [CLEAN] Jammer connected?? (QAM-16)
+  [CLEAN] Yes (QAM-16)
+  [JAMMED] [JAMMED] CORRUPTED DATA (QAM-16)
+  [CLEAN] HEY> (QAM-16)
+  [CLEAN] JAMED (QAM-16)
+  [JAMMED] [JAMMED] CORRUPTED DATA (QAM-16)
+  [CLEAN] Jammed (QAM-16)
+  [CLEAN] Jammer connected? right?? (QAM-16)
+  [CLEAN] HEY> (QAM-16)
+  [CLEAN] JAMED (QAM-16)
+  [CLEAN] Jammmmeddd i know (QAM-16)
+  [CLEAN] Jammed (QAM-16)
+  [CLEAN] Jammed (QAM-16)
+  [JAMMED] [JAMMED] CORRUPTED DATA (QAM-16)
+  [CLEAN] hi? (QAM-16)
+  [CLEAN] Buffered? (QAM-16)
+  [CLEAN] JJ (QAM-16)
+  [CLEAN] BB (QAM-16)
+  [JAMMED] [JAMMED] CORRUPTED DATA (QAM-16)
+  [JAMMED] [JAMMED] CORRUPTED DATA (QAM-16)
+  [CLEAN] Jammer gone? (QAM-16)
+  [CLEAN] ITs clear or not? (QAM-16)
+  [CLEAN] Jammed (QAM-16)
+  [CLEAN] BB (QAM-16)
+  [CLEAN] JOOOOO (QAM-16)
+  [CLEAN] JOOOOOOOOOOOOOO (QAM-16)
+  [CLEAN] Jammer gone? (QAM-16)
+  [CLEAN] Jammer gone? (QAM-16)
+  [CLEAN] Jammer gone? (QAM-16)
+  [CLEAN] Yes (QAM-16)
