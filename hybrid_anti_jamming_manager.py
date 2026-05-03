@@ -154,9 +154,11 @@ class HybridAntiJammingManager:
         interference_type = "NONE"
         if len(ofdm_signal) > 0:
             spectrum_result = spectrum_sensor.sense_channel(ofdm_signal)
-            spectrum_state = spectrum_result.get('state', 'IDLE')
+            raw_state = spectrum_result.get('state', 'IDLE')
+            spectrum_state = raw_state.name if hasattr(raw_state, 'name') else str(raw_state)
             spectrum_confidence = 1.0 if spectrum_result.get('is_jammed', False) else 0.2
-            interference_type = spectrum_result.get('interference_type', 'NONE')
+            raw_interference = spectrum_result.get('interference_type', 'NONE')
+            interference_type = raw_interference.name if hasattr(raw_interference, 'name') else str(raw_interference)
         
         # ============ FEATURE-BASED ML DETECTION ============
         feature_threat_conf = 0.0
