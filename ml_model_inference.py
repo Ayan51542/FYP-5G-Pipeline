@@ -1,11 +1,11 @@
 """
-Comprehensive ML Pipeline for RF Jamming Dataset - GPU Optimized Edition
-Supports streaming data generators for 14.5GB datasets on Kaggle T4 GPU
+RF Jamming ML Pipeline - Hybrid Architecture with Optimized I/O
 Features:
-  - tf.data.Dataset pipeline for memory-efficient data streaming
-  - GPU acceleration for Deep Learning and XGBoost
-  - Separate pipelines for Traditional ML (10K files) and Deep Learning (Full dataset)
-  - Explicit GPU device detection and utilization
+  - Random Forest: In-memory training on unified data split
+  - XGBoost: Out-of-core GPU training with custom DataIter
+  - Deep Learning: Buffered I/O strategy (reads N files at once, yields large batches)
+  - All models evaluated on unified X_test_scaled with fault tolerance
+  - Optimized for Kaggle T4 GPU with 30GB RAM
 """
 
 import os
@@ -17,6 +17,7 @@ import warnings
 import gc
 from datetime import datetime
 from pathlib import Path
+
 try:
     import joblib
 except ImportError:
@@ -44,11 +45,30 @@ from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLRO
 warnings.filterwarnings('ignore')
 
 # ============================================================================
+# GLOBAL CONFIGURATION
+# ============================================================================
+
+MAX_FILES = 10000  # Maximum files to load in memory for RF and test set
+BUFFER_FILES = 20  # Number of files to buffer for Keras I/O strategy
+BATCH_SIZE = 2048  # Large batch size for GPU efficiency
+EPOCHS = 30
+RANDOM_SEED = 42
+
+# Feature columns for RF jamming dataset
+FEATURE_COLS = ['freq1', 'noise', 'max_magnitude', 'total_gain_db', 
+                'base_pwr_db', 'rssi', 'relpwr_db', 'avgpwr_db', 'rssi_dbm', 'scan_type']
+
+# Global test set and scaler (set after load_in_memory_data)
+X_test_scaled_global = None
+scaler_global = None
+y_test_global = None
+
+# ============================================================================
 # 0. GPU SETUP AND CONFIGURATION
 # ============================================================================
 
 def setup_gpu():
-    """Configure GPU for TensorFlow and print device information"""
+    """Configure GPU for TensorFlow and validate XGBoost"""
     print(f"\n{'='*70}")
     print(f"GPU SETUP AND CONFIGURATION")
     print(f"{'='*70}\n")
@@ -62,18 +82,17 @@ def setup_gpu():
         for idx, gpu in enumerate(gpus):
             print(f"  GPU {idx}: {gpu}")
         
-        # Enable memory growth to prevent OOM issues
+        # Enable memory growth
         try:
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"\n  ✓ Memory growth enabled (prevents OOM crashes)")
+            print(f"\n  ✓ Memory growth enabled (prevents OOM)")
         except:
             print(f"\n  ⚠️  Could not enable memory growth")
         
-        print(f"\n  ✓ GPU is available for TensorFlow")
         gpu_available = True
     else:
-        print(f"  ⚠️  NO GPU DETECTED - Training will be slow on CPU")
+        print(f"  ⚠️  NO GPU DETECTED")
         gpu_available = False
     
     # Check XGBoost GPU capability
@@ -81,263 +100,38 @@ def setup_gpu():
     try:
         test_model = xgb.XGBClassifier(tree_method='hist', device='cuda')
         print(f"  ✓ XGBoost GPU support available (device='cuda')")
-        xgb_gpu_available = True
+        xgb_gpu = True
     except:
-        print(f"  ⚠️  XGBoost GPU not available, will use CPU (hist)")
-        xgb_gpu_available = False
+        print(f"  ⚠️  XGBoost GPU not available, will use CPU")
+        xgb_gpu = False
     
     print(f"\n{'='*70}\n")
     
-    return gpu_available, xgb_gpu_available
+    return gpu_available, xgb_gpu
 
 
 # ============================================================================
-# 1. DATA GENERATOR FOR STREAMING DATASETS
+# 1. UNIFIED IN-MEMORY DATA LOADING & SCALING
 # ============================================================================
 
-class FastKerasDataGenerator(keras.utils.Sequence):
+def load_in_memory_data(csv_files, random_seed=RANDOM_SEED):
     """
-    High-speed chunking data generator for Keras.
-    Reads N full files into a memory buffer to eliminate Disk I/O bottlenecks.
-    """
+    Load up to MAX_FILES into memory, preprocess, split, and scale.
+    Returns X_train_scaled, X_test_scaled, y_train, y_test, scaler, all_files
     
-    def __init__(self, csv_files, batch_size=2048, feature_cols=None, 
-                 files_per_chunk=20, random_seed=42, scaler=None):
-        """
-        Initialize high-speed Keras data generator.
-        
-        Args:
-            csv_files: List of CSV file paths
-            batch_size: Batch size (default 2048 for GPU saturation)
-            feature_cols: Feature column names
-            files_per_chunk: Number of files to load into buffer at once
-            random_seed: Random seed
-            scaler: Fitted StandardScaler for feature normalization
-        """
-        self.csv_files = csv_files
-        self.batch_size = batch_size
-        self.feature_cols = feature_cols or [
-            'freq1', 'noise', 'max_magnitude', 'total_gain_db',
-            'base_pwr_db', 'rssi', 'relpwr_db', 'avgpwr_db', 'rssi_dbm', 'scan_type'
-        ]
-        self.files_per_chunk = files_per_chunk
-        self.random_seed = random_seed
-        self.scaler = scaler
-        
-        # Estimate dataset size
-        estimated_total_rows = len(csv_files) * 1000
-        self.steps_per_epoch = max(1, estimated_total_rows // batch_size)
-        
-        self.on_epoch_end()
-    
-    def _read_file_chunk(self, chunk_files):
-        """Read N files at once into a single buffer"""
-        dataframes = []
-        
-        for file_path in chunk_files:
-            try:
-                df = pd.read_csv(file_path)
-                
-                # Extract label from path
-                if 'benign' in file_path.lower():
-                    df['label'] = 0
-                elif 'malicious' in file_path.lower():
-                    df['label'] = 1
-                else:
-                    continue
-                
-                # Add scan type
-                df['scan_type'] = 1 if 'active_scan' in file_path.lower() else 0
-                
-                # RSSI conversion
-                if 'rssi' in df.columns:
-                    df['rssi_dbm'] = df['rssi'] - 95
-                
-                # Select available columns
-                available_cols = [col for col in self.feature_cols if col in df.columns]
-                df_clean = df[available_cols + ['label']].dropna()
-                
-                if len(df_clean) > 0:
-                    dataframes.append(df_clean)
-            
-            except:
-                continue
-        
-        if not dataframes:
-            return None, None
-        
-        # Combine all files in chunk
-        combined_df = pd.concat(dataframes, ignore_index=True)
-        combined_df = combined_df.sample(frac=1, random_state=self.random_seed).reset_index(drop=True)
-        
-        X = combined_df[available_cols].values.astype(np.float32)
-        y = combined_df['label'].values.astype(np.float32)
-        
-        # Apply scaling if scaler provided
-        if self.scaler is not None:
-            X = self.scaler.transform(X).astype(np.float32)
-        
-        return X, y
-    
-    def __len__(self):
-        """Return number of batches per epoch"""
-        return self.steps_per_epoch
-    
-    def __getitem__(self, idx):
-        """Get batch at index"""
-        # Calculate which chunk of files to load
-        chunk_idx = (idx * self.batch_size) // (self.files_per_chunk * 1000)
-        file_start = (chunk_idx % max(1, len(self.csv_files) // self.files_per_chunk)) * self.files_per_chunk
-        file_end = min(file_start + self.files_per_chunk, len(self.csv_files))
-        
-        current_files = self.csv_files[file_start:file_end]
-        X_chunk, y_chunk = self._read_file_chunk(current_files)
-        
-        if X_chunk is None:
-            n_features = len(self.feature_cols)
-            return np.zeros((self.batch_size, n_features), dtype=np.float32), \
-                   np.zeros(self.batch_size, dtype=np.float32)
-        
-        # Extract batch from chunk
-        batch_start = (idx * self.batch_size) % max(1, len(X_chunk))
-        batch_end = batch_start + self.batch_size
-        
-        X_batch = X_chunk[batch_start:batch_end]
-        y_batch = y_chunk[batch_start:batch_end]
-        
-        # Pad batch if needed
-        if len(X_batch) < self.batch_size:
-            pad_size = self.batch_size - len(X_batch)
-            X_pad = np.zeros((pad_size, X_batch.shape[1]), dtype=np.float32)
-            y_pad = np.zeros(pad_size, dtype=np.float32)
-            X_batch = np.vstack([X_batch, X_pad])
-            y_batch = np.concatenate([y_batch, y_pad])
-        
-        return X_batch, y_batch
-    
-    def on_epoch_end(self):
-        """Shuffle file list after each epoch"""
-        random.shuffle(self.csv_files)
-
-
-
-
-def create_tf_dataset_from_files(csv_files, batch_size=32, feature_cols=None, 
-                                 shuffle_buffer=1000, mode='train'):
-    """
-    Create tf.data.Dataset from CSV files for efficient streaming.
-    
-    Args:
-        csv_files: List of CSV file paths
-        batch_size: Batch size
-        feature_cols: List of feature column names
-        shuffle_buffer: Buffer size for shuffling
-        mode: 'train' or 'eval' (for shuffle behavior)
-        
-    Returns:
-        tf.data.Dataset optimized for GPU training
+    This unified split is used for:
+    - Training Random Forest
+    - Final evaluation of ALL models (RF, XGBoost, DNN, CNN1D, LSTM)
     """
     
-    if feature_cols is None:
-        feature_cols = ['freq1', 'noise', 'max_magnitude', 'total_gain_db',
-                       'base_pwr_db', 'rssi', 'relpwr_db', 'avgpwr_db', 'rssi_dbm', 'scan_type']
-    
-    def load_and_preprocess_csv(file_path):
-        """Load and preprocess a single CSV file"""
-        try:
-            df = pd.read_csv(file_path)
-            
-            # Extract label
-            if b'benign' in file_path or 'benign' in str(file_path):
-                label = 0
-            elif b'malicious' in file_path or 'malicious' in str(file_path):
-                label = 1
-            else:
-                return None, None
-            
-            # Add features
-            df['scan_type'] = 1 if 'active_scan' in str(file_path).lower() else 0
-            if 'rssi' in df.columns:
-                df['rssi_dbm'] = df['rssi'] - 95
-            
-            # Get features
-            available_cols = [col for col in feature_cols if col in df.columns]
-            df_clean = df[available_cols].dropna()
-            
-            if len(df_clean) > 0:
-                X = df_clean.values.astype(np.float32)
-                y = np.full(len(X), label, dtype=np.float32)
-                return X, y
-            
-            return None, None
-            
-        except Exception as e:
-            return None, None
-    
-    def generator():
-        """Generator function for tf.data.Dataset"""
-        random.shuffle(csv_files)
-        
-        for file_path in csv_files:
-            X, y = load_and_preprocess_csv(file_path)
-            
-            if X is not None:
-                for x_sample, y_sample in zip(X, y):
-                    yield x_sample, y_sample
-    
-    # Create dataset
-    num_features = len(feature_cols)
-    dataset = tf.data.Dataset.from_generator(
-        generator,
-        output_signature=(
-            tf.TensorSpec(shape=(num_features,), dtype=tf.float32),
-            tf.TensorSpec(shape=(), dtype=tf.float32)
-        )
-    )
-    
-    # Apply optimizations
-    if mode == 'train':
-        dataset = dataset.shuffle(buffer_size=shuffle_buffer)
-    
-    dataset = dataset.batch(batch_size)
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
-    
-    return dataset
-
-
-# ============================================================================
-# 2. TRADITIONAL ML DATA LOADER (LIMITED TO 10K FILES)
-# ============================================================================
-
-def load_traditional_ml_data(base_path, max_files=10000, random_seed=42):
-    """
-    Load data for traditional ML models (Random Forest, XGBoost).
-    Limited to max_files to manage RAM and training time.
-    
-    Args:
-        base_path: Path to dataset root
-        max_files: Maximum number of files to load (default 10K for RAM efficiency)
-        random_seed: Random seed
-        
-    Returns:
-        X_train_scaled, X_test_scaled, y_train, y_test, scaler
-    """
-    
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Loading Traditional ML Dataset")
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Loading In-Memory Data")
     print(f"{'-'*70}")
-    print(f"Note: Traditional ML (sklearn) limited to {max_files} files due to RAM constraints")
-    
-    # Find all CSV files
-    all_files = glob.glob(os.path.join(base_path, '**', '*.csv'), recursive=True)
-    print(f"Total CSV files found: {len(all_files)}")
-    
-    if len(all_files) == 0:
-        raise FileNotFoundError(f"No CSV files found in {base_path}")
+    print(f"Note: Loading up to {MAX_FILES} files into memory")
     
     # Random sample
     random.seed(random_seed)
-    sample_files = random.sample(all_files, min(max_files, len(all_files)))
-    print(f"Using {len(sample_files)} files for Traditional ML training")
+    sample_files = random.sample(csv_files, min(MAX_FILES, len(csv_files)))
+    print(f"Using {len(sample_files)} files for unified data split")
     
     dataframes = []
     
@@ -356,8 +150,10 @@ def load_traditional_ml_data(base_path, max_files=10000, random_seed=42):
             else:
                 continue
             
-            # Add features
+            # Add scan type
             df['scan_type'] = 1 if 'active_scan' in file_path.lower() else 0
+            
+            # RSSI conversion
             if 'rssi' in df.columns:
                 df['rssi_dbm'] = df['rssi'] - 95
             
@@ -374,17 +170,13 @@ def load_traditional_ml_data(base_path, max_files=10000, random_seed=42):
     print(f"Total rows: {len(master_df)}")
     print(f"Label distribution: {master_df['label'].value_counts().to_dict()}")
     
-    # Define features
-    feature_cols = ['freq1', 'noise', 'max_magnitude', 'total_gain_db', 
-                    'base_pwr_db', 'rssi', 'relpwr_db', 'avgpwr_db', 'rssi_dbm', 'scan_type']
-    feature_cols = [col for col in feature_cols if col in master_df.columns]
-    
-    # Clean data
-    df_clean = master_df[feature_cols + ['label']].dropna()
+    # Select available features
+    available_cols = [col for col in FEATURE_COLS if col in master_df.columns]
+    df_clean = master_df[available_cols + ['label']].dropna()
     print(f"Rows after cleaning: {len(df_clean)}")
     
-    X = df_clean[feature_cols].values
-    y = df_clean['label'].values
+    X = df_clean[available_cols].values.astype(np.float32)
+    y = df_clean['label'].values.astype(np.float32)
     
     # Split and scale
     X_train, X_test, y_train, y_test = train_test_split(
@@ -392,20 +184,169 @@ def load_traditional_ml_data(base_path, max_files=10000, random_seed=42):
     )
     
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    X_train_scaled = scaler.fit_transform(X_train).astype(np.float32)
+    X_test_scaled = scaler.transform(X_test).astype(np.float32)
     
     print(f"Train shape: {X_train_scaled.shape}, Test shape: {X_test_scaled.shape}\n")
     
-    return X_train_scaled, X_test_scaled, y_train, y_test, scaler
+    return X_train_scaled, X_test_scaled, y_train, y_test, scaler, available_cols
 
 
 # ============================================================================
-# 3. MODEL DEFINITIONS
+# 2. XGBOOST TRAINING (GPU-OPTIMIZED WITH XGBCLASSIFIER)
+# ============================================================================
+# XGBoost is trained using XGBClassifier for simplicity and compatibility.
+# It uses tree_method='hist' with GPU acceleration (device='cuda' if available).
+# Training happens on unified in-memory data (10,000 files) with evaluation set.
+
+
+class OptimizedKerasGenerator(keras.utils.Sequence):
+    """
+    High-speed Keras generator with buffering strategy.
+    Loads BUFFER_FILES at once, scales, shuffles, yields large batches (2048).
+    """
+    
+    def __init__(self, csv_files, scaler, feature_cols, batch_size=2048, 
+                 buffer_files=20, random_seed=42):
+        """
+        Args:
+            csv_files: List of CSV file paths
+            scaler: Fitted StandardScaler
+            feature_cols: List of feature column names
+            batch_size: Batch size to yield (default 2048 for GPU)
+            buffer_files: Number of files to buffer at once
+            random_seed: Seed for reproducibility
+        """
+        self.csv_files = csv_files
+        self.scaler = scaler
+        self.feature_cols = feature_cols
+        self.batch_size = batch_size
+        self.buffer_files = buffer_files
+        self.random_seed = random_seed
+        
+        self.file_index = 0
+        self.buffer = None
+        self.buffer_index = 0
+        
+        random.seed(random_seed)
+        random.shuffle(self.csv_files)
+        
+        # Pre-calculate length estimate
+        self.steps_per_epoch = max(1, len(csv_files) // buffer_files)
+    
+    def __len__(self):
+        """Number of batches per epoch"""
+        return self.steps_per_epoch
+    
+    def _load_buffer(self):
+        """Load next buffer of files"""
+        dataframes = []
+        
+        for _ in range(self.buffer_files):
+            if self.file_index >= len(self.csv_files):
+                break
+            
+            file_path = self.csv_files[self.file_index]
+            self.file_index += 1
+            
+            try:
+                df = pd.read_csv(file_path)
+                
+                # Extract label
+                if 'benign' in file_path.lower():
+                    df['label'] = 0
+                elif 'malicious' in file_path.lower():
+                    df['label'] = 1
+                else:
+                    continue
+                
+                # Add features
+                df['scan_type'] = 1 if 'active_scan' in file_path.lower() else 0
+                if 'rssi' in df.columns:
+                    df['rssi_dbm'] = df['rssi'] - 95
+                
+                dataframes.append(df)
+            
+            except:
+                continue
+        
+        if not dataframes:
+            # Fallback: load at least one more file
+            if self.file_index < len(self.csv_files):
+                return self._load_buffer()
+            else:
+                return False
+        
+        # Combine and preprocess
+        buffer_df = pd.concat(dataframes, ignore_index=True)
+        available_cols = [col for col in self.feature_cols if col in buffer_df.columns]
+        buffer_df = buffer_df[available_cols + ['label']].dropna()
+        
+        if len(buffer_df) == 0:
+            return False
+        
+        # Shuffle buffer
+        buffer_df = buffer_df.sample(frac=1, random_state=self.random_seed).reset_index(drop=True)
+        
+        # Scale features
+        X = buffer_df[available_cols].values.astype(np.float32)
+        X_scaled = self.scaler.transform(X).astype(np.float32)
+        y = buffer_df['label'].values.astype(np.float32)
+        
+        self.buffer = (X_scaled, y)
+        self.buffer_index = 0
+        
+        return True
+    
+    def __getitem__(self, idx):
+        """Get batch at index"""
+        # Load initial buffer if needed
+        if self.buffer is None:
+            if not self._load_buffer():
+                # Return dummy batch
+                X_dummy = np.zeros((self.batch_size, len(self.feature_cols)), dtype=np.float32)
+                y_dummy = np.zeros(self.batch_size, dtype=np.float32)
+                return X_dummy, y_dummy
+        
+        X_scaled, y = self.buffer
+        
+        # Get batch
+        end_idx = min(self.buffer_index + self.batch_size, len(X_scaled))
+        X_batch = X_scaled[self.buffer_index:end_idx]
+        y_batch = y[self.buffer_index:end_idx]
+        
+        self.buffer_index = end_idx
+        
+        # Reload buffer if exhausted
+        if self.buffer_index >= len(X_scaled):
+            if not self._load_buffer():
+                # Shuffle and reload entire dataset
+                self.file_index = 0
+                random.shuffle(self.csv_files)
+                self._load_buffer()
+        
+        # Pad batch if needed
+        if len(X_batch) < self.batch_size:
+            pad_size = self.batch_size - len(X_batch)
+            X_batch = np.vstack([X_batch, np.tile(X_batch[-1], (pad_size, 1))])
+            y_batch = np.hstack([y_batch, np.tile(y_batch[-1], pad_size)])
+        
+        return X_batch, y_batch
+    
+    def on_epoch_end(self):
+        """Shuffle after each epoch"""
+        self.file_index = 0
+        self.buffer = None
+        self.buffer_index = 0
+        random.shuffle(self.csv_files)
+
+
+# ============================================================================
+# 4. MODEL DEFINITIONS WITH FAULT TOLERANCE
 # ============================================================================
 
 class MLPipeline:
-    """Unified ML Pipeline with GPU optimization"""
+    """Unified ML Pipeline with fault tolerance"""
     
     def __init__(self, random_seed=42, xgb_gpu=True):
         self.random_seed = random_seed
@@ -425,8 +366,98 @@ class MLPipeline:
             n_jobs=-1,
             verbose=0
         )
-        self.models['RandomForest'] = model
         return model
+    
+    
+    def build_dnn(self, input_dim):
+        """Deep Neural Network"""
+        model = models.Sequential([
+            layers.Input(shape=(input_dim,)),
+            layers.Dense(256, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(128, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(64, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(1, activation='sigmoid')
+        ])
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            loss='binary_crossentropy',
+            metrics=['accuracy', keras.metrics.AUC(name='auc')]
+        )
+        return model
+    
+    def build_cnn_1d(self, input_dim):
+        """1D CNN"""
+        model = models.Sequential([
+            layers.Input(shape=(input_dim, 1)),
+            layers.Conv1D(64, 3, activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.MaxPooling1D(pool_size=2),
+            layers.Dropout(0.3),
+            layers.Conv1D(128, 3, activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.MaxPooling1D(pool_size=2),
+            layers.Dropout(0.3),
+            layers.Conv1D(256, 3, activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Flatten(),
+            layers.Dense(128, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(1, activation='sigmoid')
+        ])
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            loss='binary_crossentropy',
+            metrics=['accuracy', keras.metrics.AUC(name='auc')]
+        )
+        return model
+    
+    def build_lstm(self, input_dim):
+        """LSTM"""
+        model = models.Sequential([
+            layers.Input(shape=(input_dim, 1)),
+            layers.LSTM(128, activation='relu', return_sequences=True),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.LSTM(64, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(64, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(1, activation='sigmoid')
+        ])
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            loss='binary_crossentropy',
+            metrics=['accuracy', keras.metrics.AUC(name='auc')]
+        )
+        return model
+    
+    def train_random_forest(self, X_train, y_train):
+        """Train RF with fault tolerance"""
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Training Random Forest...")
+        try:
+            rf_model = self.build_random_forest()
+            rf_model.fit(X_train, y_train)
+            self.models['RandomForest'] = rf_model
+            
+            # Save checkpoint
+            try:
+                joblib.dump(rf_model, 'random_forest_model.joblib')
+                print(f"  ✓ RF trained & checkpoint saved")
+            except:
+                print(f"  ✓ RF trained (checkpoint save failed)")
+        
+        except Exception as e:
+            print(f"  ❌ RF training failed: {e}")
     
     def build_xgboost(self, n_estimators=100, max_depth=7, learning_rate=0.1):
         """XGBoost classifier with GPU optimization"""
@@ -439,6 +470,8 @@ class MLPipeline:
                 random_state=self.random_seed,
                 tree_method='hist',
                 device='cuda',
+                objective='binary:logistic',
+                base_score=0.5,
                 eval_metric='logloss',
                 verbosity=0
             )
@@ -451,133 +484,17 @@ class MLPipeline:
                 learning_rate=learning_rate,
                 random_state=self.random_seed,
                 tree_method='hist',
+                objective='binary:logistic',
+                base_score=0.5,
                 eval_metric='logloss',
                 verbosity=0
             )
             print("  [XGBoost configured for CPU (hist - faster than default)]")
         
-        self.models['XGBoost'] = model
         return model
     
-    def build_dnn(self, input_dim, hidden_units=[256, 128, 64], dropout_rate=0.3):
-        """Deep Neural Network optimized for GPU"""
-        model = models.Sequential([
-            layers.Input(shape=(input_dim,)),
-            layers.Dense(hidden_units[0], activation='relu'),
-            layers.BatchNormalization(),
-            layers.Dropout(dropout_rate),
-            
-            layers.Dense(hidden_units[1], activation='relu'),
-            layers.BatchNormalization(),
-            layers.Dropout(dropout_rate),
-            
-            layers.Dense(hidden_units[2], activation='relu'),
-            layers.BatchNormalization(),
-            layers.Dropout(dropout_rate),
-            
-            layers.Dense(1, activation='sigmoid')
-        ])
-        
-        model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=0.001),
-            loss='binary_crossentropy',
-            metrics=['accuracy', keras.metrics.AUC(name='auc')]
-        )
-        
-        self.models['DNN'] = model
-        return model
-    
-    def build_cnn_1d(self, input_dim, num_filters=64, kernel_size=3):
-        """1D CNN for spectral pattern detection (GPU optimized)"""
-        model = models.Sequential([
-            layers.Input(shape=(input_dim, 1)),
-            
-            layers.Conv1D(num_filters, kernel_size, activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.MaxPooling1D(pool_size=2),
-            layers.Dropout(0.3),
-            
-            layers.Conv1D(num_filters*2, kernel_size, activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.MaxPooling1D(pool_size=2),
-            layers.Dropout(0.3),
-            
-            layers.Conv1D(num_filters*4, kernel_size, activation='relu', padding='same'),
-            layers.BatchNormalization(),
-            layers.Dropout(0.3),
-            
-            layers.Flatten(),
-            layers.Dense(128, activation='relu'),
-            layers.BatchNormalization(),
-            layers.Dropout(0.3),
-            
-            layers.Dense(1, activation='sigmoid')
-        ])
-        
-        model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=0.001),
-            loss='binary_crossentropy',
-            metrics=['accuracy', keras.metrics.AUC(name='auc')]
-        )
-        
-        self.models['CNN1D'] = model
-        return model
-    
-    def build_lstm(self, input_dim, lstm_units=128):
-        """LSTM for sequential RF data (GPU optimized)"""
-        model = models.Sequential([
-            layers.Input(shape=(input_dim, 1)),
-            
-            layers.LSTM(lstm_units, activation='relu', return_sequences=True),
-            layers.BatchNormalization(),
-            layers.Dropout(0.3),
-            
-            layers.LSTM(lstm_units // 2, activation='relu'),
-            layers.BatchNormalization(),
-            layers.Dropout(0.3),
-            
-            layers.Dense(64, activation='relu'),
-            layers.BatchNormalization(),
-            layers.Dropout(0.3),
-            
-            layers.Dense(1, activation='sigmoid')
-        ])
-        
-        model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=0.001),
-            loss='binary_crossentropy',
-            metrics=['accuracy', keras.metrics.AUC(name='auc')]
-        )
-        
-        self.models['LSTM'] = model
-        return model
-    
-    def train_traditional_models(self, X_train, y_train, X_test, y_test, verbose=True):
-        """Train Random Forest and XGBoost on traditional ML subset with checkpointing"""
-        print(f"\n{'='*70}")
-        print(f"Training Traditional ML Models (Random Forest + XGBoost)")
-        print(f"{'='*70}\n")
-        
-        # Random Forest with fault tolerance
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Training Random Forest...")
-        try:
-            rf_model = self.build_random_forest()
-            rf_model.fit(X_train, y_train)
-            rf_score = rf_model.score(X_test, y_test)
-            print(f"  ✓ Random Forest Test Accuracy: {rf_score:.4f}")
-            
-            # Save checkpoint
-            try:
-                joblib.dump(rf_model, 'random_forest_model.joblib')
-                print(f"  ✓ Random Forest model saved: random_forest_model.joblib")
-            except Exception as save_err:
-                print(f"  ⚠️  Could not save Random Forest model: {save_err}")
-        
-        except Exception as e:
-            print(f"  ❌ Random Forest training failed: {e}")
-            print(f"  Continuing with next model...\n")
-        
-        # XGBoost with fault tolerance
+    def train_xgboost_streaming(self, X_train, X_test, y_train, y_test):
+        """Train XGBoost on unified in-memory data with GPU optimization"""
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Training XGBoost...")
         try:
             xgb_model = self.build_xgboost()
@@ -588,6 +505,8 @@ class MLPipeline:
             )
             xgb_score = xgb_model.score(X_test, y_test)
             print(f"  ✓ XGBoost Test Accuracy: {xgb_score:.4f}")
+            
+            self.models['XGBoost'] = xgb_model
             
             # Save checkpoint
             try:
@@ -600,159 +519,156 @@ class MLPipeline:
             print(f"  ❌ XGBoost training failed: {e}")
             print(f"  Continuing with next models...\n")
     
-    def train_deep_learning_models_streaming(self, base_path, csv_files, epochs=30, 
-                                            batch_size=2048, validation_split=0.1, scaler=None):
-        """Train Deep Learning models using optimized buffered I/O generator"""
-        print(f"\n{'='*70}")
-        print(f"Training Deep Learning Models (Optimized Buffered I/O - 20 files/chunk)")
-        print(f"{'='*70}\n")
-        
-        feature_cols = ['freq1', 'noise', 'max_magnitude', 'total_gain_db', 
-                       'base_pwr_db', 'rssi', 'relpwr_db', 'avgpwr_db', 'rssi_dbm', 'scan_type']
-        
-        # Base callbacks (EarlyStopping and ReduceLROnPlateau) - shared across models
-        base_callbacks = [
-            EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
-        ]
-        
-        # Create data generator
-        print(f"Creating optimized data generator ({len(csv_files)} files, batch_size={batch_size})...")
-        train_generator = FastKerasDataGenerator(
-            csv_files, 
-            batch_size=batch_size,
-            feature_cols=feature_cols,
-            files_per_chunk=20,
-            scaler=scaler
-        )
-        
-        input_dim = len(feature_cols)
-        steps_per_epoch = len(train_generator)
-        
-        # Train DNN with fault tolerance and checkpointing
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Training DNN (optimized streaming)...")
+    def train_dnn_streaming(self, csv_files, feature_cols):
+        """Train DNN with buffered I/O"""
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Training DNN (streaming)...")
         try:
+            input_dim = len(feature_cols)
             dnn_model = self.build_dnn(input_dim)
-            dnn_checkpoint = ModelCheckpoint('dnn_best_weights.keras', monitor='val_loss', 
-                                            save_best_only=True, verbose=0)
-            dnn_callbacks = base_callbacks + [dnn_checkpoint]
+            
+            generator = OptimizedKerasGenerator(
+                csv_files,
+                scaler_global,
+                feature_cols,
+                batch_size=BATCH_SIZE,
+                buffer_files=BUFFER_FILES,
+                random_seed=self.random_seed
+            )
+            
+            checkpoint = ModelCheckpoint('dnn_best_weights.keras', monitor='val_loss',
+                                        save_best_only=True, verbose=0)
+            callbacks = [
+                EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
+                ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6),
+                checkpoint
+            ]
             
             dnn_model.fit(
-                train_generator,
-                steps_per_epoch=steps_per_epoch,
-                epochs=epochs,
-                callbacks=dnn_callbacks,
+                generator,
+                steps_per_epoch=len(generator),
+                epochs=EPOCHS,
+                callbacks=callbacks,
                 verbose=1
             )
             
-            # Save final DNN model
             dnn_model.save('dnn_model_final.keras')
-            print(f"  ✓ DNN training complete - Model saved: dnn_model_final.keras")
+            self.models['DNN'] = dnn_model
+            print(f"  ✓ DNN trained & saved")
         
         except Exception as e:
             print(f"  ❌ DNN training failed: {e}")
-            print(f"  Continuing with next model...\n")
-        
-        # Train CNN1D with fault tolerance and checkpointing
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Training CNN1D (optimized streaming)...")
+    
+    def train_cnn1d_streaming(self, csv_files, feature_cols):
+        """Train CNN1D with buffered I/O"""
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Training CNN1D (streaming)...")
         try:
+            input_dim = len(feature_cols)
             cnn_model = self.build_cnn_1d(input_dim)
             
             # Custom generator that reshapes for Conv1D
-            class CNN1DGenerator(FastKerasDataGenerator):
+            class CNN1DGenerator(OptimizedKerasGenerator):
                 def __getitem__(self, idx):
                     X, y = super().__getitem__(idx)
                     return X.reshape(X.shape[0], X.shape[1], 1), y
             
-            cnn_generator = CNN1DGenerator(
+            generator = CNN1DGenerator(
                 csv_files,
-                batch_size=batch_size,
-                feature_cols=feature_cols,
-                files_per_chunk=20,
-                scaler=scaler
+                scaler_global,
+                feature_cols,
+                batch_size=BATCH_SIZE,
+                buffer_files=BUFFER_FILES,
+                random_seed=self.random_seed
             )
             
-            cnn_checkpoint = ModelCheckpoint('cnn_best_weights.keras', monitor='val_loss', 
-                                            save_best_only=True, verbose=0)
-            cnn_callbacks = base_callbacks + [cnn_checkpoint]
+            checkpoint = ModelCheckpoint('cnn_best_weights.keras', monitor='val_loss',
+                                        save_best_only=True, verbose=0)
+            callbacks = [
+                EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
+                ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6),
+                checkpoint
+            ]
             
             cnn_model.fit(
-                cnn_generator,
-                steps_per_epoch=len(cnn_generator),
-                epochs=epochs,
-                callbacks=cnn_callbacks,
+                generator,
+                steps_per_epoch=len(generator),
+                epochs=EPOCHS,
+                callbacks=callbacks,
                 verbose=1
             )
             
-            # Save final CNN1D model
             cnn_model.save('cnn_model_final.keras')
-            print(f"  ✓ CNN1D training complete - Model saved: cnn_model_final.keras")
+            self.models['CNN1D'] = cnn_model
+            print(f"  ✓ CNN1D trained & saved")
         
         except Exception as e:
             print(f"  ❌ CNN1D training failed: {e}")
-            print(f"  Continuing with next model...\n")
-        
-        # Train LSTM with fault tolerance and checkpointing
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Training LSTM (optimized streaming)...")
+    
+    def train_lstm_streaming(self, csv_files, feature_cols):
+        """Train LSTM with buffered I/O"""
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Training LSTM (streaming)...")
         try:
+            input_dim = len(feature_cols)
             lstm_model = self.build_lstm(input_dim)
             
             # Custom generator that reshapes for LSTM
-            class LSTMGenerator(FastKerasDataGenerator):
+            class LSTMGenerator(OptimizedKerasGenerator):
                 def __getitem__(self, idx):
                     X, y = super().__getitem__(idx)
                     return X.reshape(X.shape[0], X.shape[1], 1), y
             
-            lstm_generator = LSTMGenerator(
+            generator = LSTMGenerator(
                 csv_files,
-                batch_size=batch_size,
-                feature_cols=feature_cols,
-                files_per_chunk=20,
-                scaler=scaler
+                scaler_global,
+                feature_cols,
+                batch_size=BATCH_SIZE,
+                buffer_files=BUFFER_FILES,
+                random_seed=self.random_seed
             )
             
-            lstm_checkpoint = ModelCheckpoint('lstm_best_weights.keras', monitor='val_loss', 
-                                             save_best_only=True, verbose=0)
-            lstm_callbacks = base_callbacks + [lstm_checkpoint]
+            checkpoint = ModelCheckpoint('lstm_best_weights.keras', monitor='val_loss',
+                                        save_best_only=True, verbose=0)
+            callbacks = [
+                EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
+                ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6),
+                checkpoint
+            ]
             
             lstm_model.fit(
-                lstm_generator,
-                steps_per_epoch=len(lstm_generator),
-                epochs=epochs,
-                callbacks=lstm_callbacks,
+                generator,
+                steps_per_epoch=len(generator),
+                epochs=EPOCHS,
+                callbacks=callbacks,
                 verbose=1
             )
             
-            # Save final LSTM model
             lstm_model.save('lstm_model_final.keras')
-            print(f"  ✓ LSTM training complete - Model saved: lstm_model_final.keras")
+            self.models['LSTM'] = lstm_model
+            print(f"  ✓ LSTM trained & saved")
         
         except Exception as e:
             print(f"  ❌ LSTM training failed: {e}")
-            print(f"  Continuing with evaluation...\n")
     
-    def evaluate_all_models(self, X_test, y_test):
-        """Evaluate all models (traditional ML + deep learning) on test set"""
+    def evaluate_all_models(self, X_test, y_test, feature_cols):
+        """Evaluate all trained models on unified test set"""
         print(f"\n{'='*70}")
-        print(f"Evaluating All Models on Test Set")
+        print(f"Evaluating All Models on Unified Test Set")
         print(f"{'='*70}\n")
         
-        # Create 3D reshaped version of X_test for CNN1D and LSTM
-        # Original X_test shape: (samples, features) -> Reshape to (samples, features, 1)
+        # 3D reshape for CNN1D and LSTM
         X_test_3d = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
         
         for model_name, model in self.models.items():
             print(f"Evaluating {model_name}...")
             
-            # Get predictions based on model type
+            # Get predictions
             if hasattr(model, 'predict_proba'):
-                # Traditional ML models (Random Forest, XGBoost) - use 2D X_test
+                # Traditional ML
                 y_pred_proba = model.predict_proba(X_test)[:, 1]
             elif model_name in ['CNN1D', 'LSTM']:
-                # Deep learning models that require 3D input - use 3D X_test
+                # Deep learning with 3D input
                 y_pred_proba = model.predict(X_test_3d, verbose=0).flatten().astype(float)
             else:
-                # DNN and other models - use 2D X_test
+                # DNN - 2D input
                 y_pred_proba = model.predict(X_test, verbose=0).flatten().astype(float)
             
             y_pred = (y_pred_proba >= 0.5).astype(int)
@@ -774,12 +690,12 @@ class MLPipeline:
             
             self.predictions[model_name] = y_pred
             
-            print(f"  ✓ {model_name}: Acc={accuracy:.4f}, F1={f1:.4f}, AUC={roc_auc:.4f}")
+            print(f"  ✓ Acc={accuracy:.4f}, F1={f1:.4f}, AUC={roc_auc:.4f}")
     
     def print_comparison_table(self):
-        """Print results table"""
+        """Print final results"""
         if not self.metrics:
-            print("No evaluation results available yet.")
+            print("No evaluation results available.")
             return None
         
         print(f"\n{'='*90}")
@@ -800,7 +716,7 @@ class MLPipeline:
         
         return comparison_df
     
-    def plot_results(self, save_path='./ml_results_streaming.png'):
+    def plot_results(self, save_path='./ml_results_hybrid.png'):
         """Plot results"""
         if not self.metrics:
             print("No metrics to plot.")
@@ -809,7 +725,7 @@ class MLPipeline:
         comparison_df = pd.DataFrame(self.metrics).T
         
         fig, axes = plt.subplots(1, 5, figsize=(18, 5))
-        fig.suptitle('RF Jamming ML Model Performance (Streaming Pipeline)', 
+        fig.suptitle('RF Jamming ML Models - Hybrid Optimized Pipeline', 
                      fontsize=14, fontweight='bold')
         
         for idx, metric in enumerate(comparison_df.columns):
@@ -833,37 +749,29 @@ class MLPipeline:
 
 
 # ============================================================================
-# 4. MAIN EXECUTION
+# MAIN EXECUTION
 # ============================================================================
 
 def main():
     """Main execution pipeline"""
     
     print(f"\n{'='*70}")
-    print(f"RF JAMMING DATASET - GPU-OPTIMIZED ML PIPELINE")
-    print(f"Kaggle T4 GPU Edition with Streaming Data Generators")
+    print(f"RF JAMMING DATASET - HYBRID OPTIMIZED ML PIPELINE")
+    print(f"In-Memory RF + Out-of-Core XGBoost + Buffered I/O Keras")
     print(f"{'='*70}\n")
     
     # Step 0: GPU setup
-    print(f"[Step 0/5] GPU Setup and Configuration")
+    print(f"[Step 0/4] GPU Setup")
     print(f"{'-'*70}")
     gpu_available, xgb_gpu = setup_gpu()
     
     # Configuration
     BASE_PATH = '/kaggle/input/datasets/daniaherzalla/radio-frequency-jamming/'
-    TRADITIONAL_ML_FILES = 10000  # Max files for traditional ML
-    EPOCHS = 30
-    BATCH_SIZE = 2048  # Large batch size for GPU saturation with new optimized generator
-    RANDOM_SEED = 42
     
-    # Check if running in Kaggle or local
+    # Check if dataset exists
     if not os.path.exists(BASE_PATH):
         print(f"⚠️  Kaggle path not found. Looking for local dataset...")
-        possible_paths = [
-            './data',
-            '../input/datasets/daniaherzalla/radio-frequency-jamming/',
-            './radio-frequency-jamming'
-        ]
+        possible_paths = ['./data', '../input/datasets/daniaherzalla/radio-frequency-jamming/', './radio-frequency-jamming']
         BASE_PATH = None
         for path in possible_paths:
             if os.path.exists(path):
@@ -877,54 +785,54 @@ def main():
     print(f"✓ Using dataset path: {BASE_PATH}\n")
     
     # Find all CSV files
-    print(f"[Step 1/5] Scanning Dataset")
+    print(f"[Step 1/4] Scanning Dataset")
     print(f"{'-'*70}")
     all_files = glob.glob(os.path.join(BASE_PATH, '**', '*.csv'), recursive=True)
     print(f"Total CSV files found: {len(all_files)}")
-    print(f"Dataset configuration:")
-    print(f"  • Traditional ML: {TRADITIONAL_ML_FILES} files (RAM-limited)")
-    print(f"  • Deep Learning: {len(all_files)} files (streaming from disk)")
+    print(f"Pipeline architecture:")
+    print(f"  • RF + Eval: {MAX_FILES} files (in-memory)")
+    print(f"  • XGBoost: {len(all_files)} files (out-of-core streaming)")
+    print(f"  • DL: {len(all_files)} files (buffered I/O, batch_size={BATCH_SIZE})")
     print()
     
-    # Step 1: Load traditional ML data
-    print(f"[Step 2/5] Loading Traditional ML Dataset")
+    # Step 2: Load unified in-memory data
+    global X_test_scaled_global, scaler_global, y_test_global
+    
+    print(f"[Step 2/4] Loading Unified In-Memory Data")
     print(f"{'-'*70}")
     try:
-        X_train, X_test, y_train, y_test, scaler = load_traditional_ml_data(
-            BASE_PATH, 
-            max_files=min(TRADITIONAL_ML_FILES, len(all_files)),
+        X_train, X_test_scaled_global, y_train, y_test_global, scaler_global, feature_cols = load_in_memory_data(
+            all_files, 
             random_seed=RANDOM_SEED
         )
     except Exception as e:
-        print(f"❌ Error loading traditional ML data: {e}")
+        print(f"❌ Error loading data: {e}")
         return
     
-    # Step 2: Train traditional ML models
-    print(f"[Step 3/5] Training Traditional ML Models")
+    # Step 3: Train all models
+    print(f"\n[Step 3/4] Training All Models")
     print(f"{'-'*70}")
+    
     pipeline = MLPipeline(random_seed=RANDOM_SEED, xgb_gpu=xgb_gpu)
-    pipeline.train_traditional_models(X_train, y_train, X_test, y_test)
     
-    # Step 3: Train deep learning with streaming
-    print(f"\n[Step 4/5] Training Deep Learning Models (Full Dataset Streaming)")
+    # Train in-memory Random Forest
+    pipeline.train_random_forest(X_train, y_train)
+    
+    # Train XGBoost on unified in-memory data
+    pipeline.train_xgboost_streaming(X_train, X_test_scaled_global, y_train, y_test_global)
+    
+    # Train deep learning with buffered I/O
+    dl_files = random.sample(all_files, min(len(all_files), 30000))
+    pipeline.train_dnn_streaming(dl_files, feature_cols)
+    pipeline.train_cnn1d_streaming(dl_files, feature_cols)
+    pipeline.train_lstm_streaming(dl_files, feature_cols)
+    
+    # Step 4: Evaluate
+    print(f"\n[Step 4/4] Evaluation")
     print(f"{'-'*70}")
-    try:
-        pipeline.train_deep_learning_models_streaming(
-            BASE_PATH,
-            all_files,
-            epochs=EPOCHS,
-            batch_size=BATCH_SIZE,
-            scaler=scaler
-        )
-    except Exception as e:
-        print(f"⚠️  Deep learning training interrupted: {e}")
+    pipeline.evaluate_all_models(X_test_scaled_global, y_test_global, feature_cols)
     
-    # Step 4: Evaluate ALL models (traditional ML + deep learning)
-    print(f"\n[Step 5/5] Evaluating All Models")
-    print(f"{'-'*70}")
-    pipeline.evaluate_all_models(X_test, y_test)
-    
-    # Final results
+    # Results
     print(f"\n{'='*70}")
     print(f"FINAL RESULTS")
     print(f"{'='*70}")
@@ -932,14 +840,12 @@ def main():
     
     # Save results
     try:
-        results_path = './model_comparison_results_streaming.csv'
-        if comparison_df is not None:
-            comparison_df.to_csv(results_path)
-            print(f"✓ Results saved to: {results_path}")
-    except Exception as e:
-        print(f"⚠️  Could not save results: {e}")
+        comparison_df.to_csv('./model_comparison_results_hybrid.csv')
+        print(f"✓ Results saved to: ./model_comparison_results_hybrid.csv")
+    except:
+        pass
     
-    # Visualize
+    # Plot results
     try:
         pipeline.plot_results()
     except Exception as e:
@@ -949,7 +855,6 @@ def main():
     print(f"✓ Pipeline completed successfully!")
     print(f"{'='*70}\n")
     
-    # Cleanup
     gc.collect()
     
     return pipeline, comparison_df

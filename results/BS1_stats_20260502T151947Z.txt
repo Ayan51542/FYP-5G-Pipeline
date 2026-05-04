@@ -1,0 +1,19 @@
+=== BASE STATION BS1 ANALYSIS ===
+
+Statistics:
+  received: 13
+  forwarded_local: 13
+  forwarded_remote: 0
+  queued: 0
+  delivered: 13
+  jammed: 6
+  ml_scored: 13
+  ml_alerts: 0
+  ml_blocked: 0
+
+Jamming Last Seen: 0.71s ago
+Total Energy Events: 12
+
+Top Senders:
+  JAZZ: 10 packets
+  R1: 2 packets

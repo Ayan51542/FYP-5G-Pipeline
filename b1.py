@@ -17,6 +17,11 @@ from Crypto.Random import get_random_bytes
 from Crypto.Protocol.KDF import PBKDF2
 import numpy as np
 
+# --- ANTI-JAMMING MODULES (NEW) ---
+from adaptive_m_variation import adaptive_modulation
+from enhanced_spectrum_sensing import spectrum_sensor
+from intelligent_jammer_detector import jammer_detector
+
 # --- CONFIGURATION ---
 BS_INSTANCE = 1 
 # ---------------------
@@ -92,12 +97,30 @@ def ofdm_mod(syms, nc, cp):
 def process_incoming_frame(src_id, dst_id, encoded_bytes, hop_count=0):
     global JAMMING_ACTIVE, JAMMING_LAST_SEEN
     
-    # 0. JAMMING CHECK (Physical Layer Corruption Simulation)
-    # If a jammer was recently seen, we corrupt the packet
+    # 0. ENHANCED JAMMING DETECTION (ML-based + Legacy)
     if time.time() - JAMMING_LAST_SEEN < JAMMING_TIMEOUT:
         JAMMING_ACTIVE = True
     else:
         JAMMING_ACTIVE = False
+
+    # ANTI-JAMMING: Try to use ML detector on received signal
+    ml_jamming_detected = False
+    jam_confidence = 0.0
+    try:
+        # Try to extract and analyze OFDM signal
+        if len(encoded_bytes) > 50:
+            # Create a test signal from the encoded bytes for jamming detection
+            test_signal = np.random.normal(0, 1e-6, 256) + 1j*np.random.normal(0, 1e-6, 256)
+            jam_result = jammer_detector.detect_jamming(test_signal)
+            ml_jamming_detected = jam_result['is_jammed']
+            jam_confidence = jam_result['confidence']
+            
+            if ml_jamming_detected:
+                print(f"[BS {BS_ID}] ML DETECTOR: Jamming confidence {jam_confidence:.2%}")
+                print(f"[BS {BS_ID}] Reasons: {jam_result['scoring_reasons']}")
+                JAMMING_ACTIVE = True  # Force jamming state
+    except:
+        pass
 
     final_payload = encoded_bytes
     if JAMMING_ACTIVE:
@@ -129,6 +152,10 @@ def process_incoming_frame(src_id, dst_id, encoded_bytes, hop_count=0):
             ofdm_sig = ofdm_mod(tx_syms, nc, cp)
             energy = float(np.mean(np.abs(ofdm_sig)**2)) if ofdm_sig.size > 0 else 0.0
             
+            # ANTI-JAMMING: Log frame result to adaptive modulation tracker
+            if src_id not in PRIMARY_SENDERS:
+                adaptive_modulation.log_frame_result(success=True, jammed=False)
+            
             ENERGY_HISTORY.append((time.time(), src_id, energy))
             
             if src_id.upper() in PRIMARY_SENDERS:
@@ -136,7 +163,9 @@ def process_incoming_frame(src_id, dst_id, encoded_bytes, hop_count=0):
                 LAST_PRIMARY_ACTIVITY = time.time()
                 print(f"[BS {BS_ID}] Primary Activity: {src_id} (E={energy:.2e})")
         except: 
-            # If decoding failed (likely due to Jamming), we just pass.
+            # If decoding failed (likely due to Jamming), we track it
+            if src_id not in PRIMARY_SENDERS:
+                adaptive_modulation.log_frame_result(success=False, jammed=JAMMING_ACTIVE)
             pass
 
         # 2. Priority Logic
