@@ -1,0 +1,6 @@
+{
+  "implementation": "ML-Hybrid Receiver (socket-based)",
+  "total_threat_events": 29,
+  "decode_successes": 24,
+  "decode_failures": 5
+}
